@@ -1,0 +1,8 @@
+[user]
+  name = Evan Zeller
+  email = evan.zeller@virtualinstruments.com
+[core]
+  editor = vim
+  ignorecase = false
+#[url "git@github.com:"]
+#insteadOf = https://github.com/
