@@ -1,8 +1,8 @@
-[user]
-  name = Evan Zeller
-  email = evan.zeller@virtualinstruments.com
+[include]
+  path = ~/.gitconfig.local
+
 [core]
-  editor = vim
+  editor = nvim
   ignorecase = false
 #[url "git@github.com:"]
 #insteadOf = https://github.com/
