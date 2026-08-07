@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# git-worktree-add — add a worktree branched off the remote default branch,
+# even in bare repos and from the project directory that holds the worktrees.
+#
+# Bare clones (git clone --bare) usually omit the
+# remote.origin.fetch = +refs/heads/*:refs/remotes/origin/* refspec, so plain
+# `git fetch` never populates refs/remotes/origin/* and the base ref doesn't
+# exist to branch from. This sets that refspec, fetches, then adds the worktree.
+#
+# It can also run from a non-git "project" directory that contains the
+# worktrees (e.g. ~/work/FrontBackEnd, with the bare repo at
+# ~/work/FrontBackEnd.git and worktrees develop/, CARE-128/ inside). In that
+# case it locates the repo from a sibling <dir>.git bare or a worktree subdir.
+#
+# If the new worktree has a .gitmodules, submodules are initialized (unless
+# --no-submodules). When a sibling bare mirror exists next to the repo's own
+# bare (e.g. mesh-services.git beside FrontBackEnd.git), the submodule is seeded
+# from it over the local file transport — fast and offline — then origin is
+# reset to the real URL. Repos without a local mirror fall back to the network.
+#
+# Top-level regular files sitting in the project directory (e.g. a gitignored
+# .env.local) are copied into the new worktree so per-machine config carries
+# over (unless --no-copy-files). Directories (the sibling worktrees) and .git
+# are skipped, as is any path the new worktree already provides.
+set -euo pipefail
+
+from=""
+submodules=1
+copy_files=1
+
+usage() {
+  cat <<'EOF'
+Usage: git-worktree-add <branch> [path] [--from <ref>] [--no-submodules] [--no-copy-files]
+
+  branch          name of the new branch to create
+  path            worktree location (default: <sibling-of-existing-worktree>/<branch>)
+  --from REF      base ref to branch from (default: remote default branch, else origin/main)
+  --no-submodules skip submodule initialization for the new worktree
+  --no-copy-files skip copying top-level project-dir files into the new worktree
+  -h, --help      show this help
+
+Run from inside the repo (any worktree or the bare dir), or from the project
+directory that holds the worktrees. Ensures the origin fetch refspec exists,
+fetches, then creates the worktree.
+EOF
+}
+
+branch=""
+path=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from) from="${2:?--from needs a ref}"; shift 2 ;;
+    --no-submodules) submodules=0; shift ;;
+    --no-copy-files) copy_files=0; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "git-worktree-add: unknown option '$1'" >&2; usage >&2; exit 1 ;;
+    *)
+      if [[ -z "$branch" ]]; then branch="$1"
+      elif [[ -z "$path" ]]; then path="$1"
+      else echo "git-worktree-add: unexpected argument '$1'" >&2; exit 1; fi
+      shift ;;
+  esac
+done
+
+if [[ -z "$branch" ]]; then
+  echo "git-worktree-add: missing branch name" >&2
+  usage >&2
+  exit 1
+fi
+
+# Initialize the new worktree's submodules. Each submodule's URL is checked
+# against a sibling bare mirror (<basename>.git next to this repo's own bare, in
+# the project-directory layout's parent). If found, seed from it over the local
+# file transport, then reset origin to the configured URL so later fetches hit
+# the real remote. No mirror -> plain network init.
+init_submodules() {
+  local wt="$1"
+  [[ -f "$wt/.gitmodules" ]] || return 0
+
+  local common siblings
+  common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir)
+  siblings=$(dirname "$common")
+
+  local key sub_path name url base mirror
+  while read -r key sub_path; do
+    name="${key#submodule.}"; name="${name%.path}"
+    url=$(git -C "$wt" config -f "$wt/.gitmodules" "submodule.$name.url")
+    base="${url##*/}"; base="${base%.git}"
+    mirror="$siblings/$base.git"
+
+    if [[ -d "$mirror" ]] && git -C "$mirror" rev-parse --is-bare-repository >/dev/null 2>&1; then
+      echo "git-worktree-add: seeding submodule '$sub_path' from local mirror $mirror"
+      if git -C "$wt" -c protocol.file.allow=always \
+             -c "submodule.$name.url=$mirror" \
+             submodule update --init "$sub_path"; then
+        git -C "$wt/$sub_path" remote set-url origin "$url"
+        continue
+      fi
+      echo "git-worktree-add: local seed failed for '$sub_path', falling back to network" >&2
+    fi
+
+    git -C "$wt" submodule update --init "$sub_path"
+  done < <(git -C "$wt" config -f "$wt/.gitmodules" --get-regexp '^submodule\..*\.path$')
+}
+
+# Copy per-machine files living directly in the project directory (the parent
+# of the worktrees) into the new worktree. Only top-level regular files are
+# copied — directories are the sibling worktrees, and .git is the shared repo
+# pointer. Anything the worktree already tracks is left untouched.
+copy_project_files() {
+  local proj_dir="$1" wt="$2"
+  local f base
+  shopt -s nullglob dotglob
+  for f in "$proj_dir"/*; do
+    base="$(basename "$f")"
+    [[ "$base" == ".git" ]] && continue
+    [[ -f "$f" ]] || continue
+    [[ -e "$wt/$base" ]] && continue
+    cp -p "$f" "$wt/$base"
+    echo "git-worktree-add: copied $base into worktree"
+  done
+  shopt -u nullglob dotglob
+}
+
+# Resolve a git context. If cwd isn't inside a repo, try to find one from the
+# project-directory layout: a sibling bare dir named "<cwd>.git", or the first
+# immediate subdirectory that is a worktree/repo.
+git_cmd=(git)
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  candidate=""
+  if [[ -d "${PWD}.git" ]] && git -C "${PWD}.git" rev-parse --is-bare-repository >/dev/null 2>&1; then
+    candidate="${PWD}.git"
+  else
+    for d in */; do
+      [[ -d "$d" ]] || continue
+      if git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then candidate="$d"; break; fi
+    done
+  fi
+  if [[ -z "$candidate" ]]; then
+    echo "git-worktree-add: not inside a git repository and none found under $PWD" >&2
+    exit 1
+  fi
+  git_cmd=(git -C "$candidate")
+fi
+
+if "${git_cmd[@]}" show-ref --verify --quiet "refs/heads/$branch"; then
+  echo "git-worktree-add: branch '$branch' already exists" >&2
+  exit 1
+fi
+
+# Locate an existing worktree; its parent is the project directory that holds
+# the worktrees and any shared per-machine files.
+main_wt=$("${git_cmd[@]}" worktree list --porcelain | awk -v RS='' '!/(^|\n)bare(\n|$)/ {print $2; exit}')
+
+# Derive a default path as a sibling of that worktree, named after the branch
+# with slashes flattened (feat/foo -> feat-foo).
+if [[ -z "$path" ]]; then
+  if [[ -z "$main_wt" ]]; then
+    echo "git-worktree-add: could not determine a default path; pass one explicitly" >&2
+    exit 1
+  fi
+  path="$(dirname "$main_wt")/${branch//\//-}"
+fi
+
+if [[ -e "$path" ]]; then
+  echo "git-worktree-add: path '$path' already exists" >&2
+  exit 1
+fi
+
+# Bare-repo gotcha: ensure the standard fetch refspec is present so the fetch
+# below populates refs/remotes/origin/*.
+if ! "${git_cmd[@]}" config --get-all remote.origin.fetch | grep -q 'refs/remotes/origin/'; then
+  "${git_cmd[@]}" config --add remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+  echo "git-worktree-add: added origin fetch refspec"
+fi
+
+"${git_cmd[@]}" fetch origin
+
+# Default base ref: the remote's default branch (origin/HEAD), falling back to
+# origin/main. FrontBackEnd, for instance, defaults to develop, not main.
+if [[ -z "$from" ]]; then
+  if def=$("${git_cmd[@]}" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null); then
+    from="${def#refs/remotes/}"
+  else
+    from="origin/main"
+  fi
+fi
+
+if ! "${git_cmd[@]}" rev-parse --verify --quiet "$from" >/dev/null; then
+  echo "git-worktree-add: base ref '$from' not found after fetch" >&2
+  exit 1
+fi
+
+"${git_cmd[@]}" worktree add -b "$branch" "$path" "$from"
+echo "git-worktree-add: created worktree at $path (branch '$branch' from '$from')"
+
+if [[ "$copy_files" -eq 1 && -n "$main_wt" ]]; then
+  copy_project_files "$(dirname "$main_wt")" "$path"
+fi
+
+if [[ "$submodules" -eq 1 ]]; then
+  init_submodules "$path"
+fi

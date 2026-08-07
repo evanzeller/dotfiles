@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+# git-worktree-prune — remove worktrees whose changes have all landed on the
+# remote, then delete their local branches.
+#
+# The counterpart to git-worktree-add: that creates one worktree per branch off
+# the remote default branch, this reclaims the ones whose work is now upstream.
+#
+# "Landed" is judged against the remote default branch (origin/HEAD, falling
+# back to origin/main) and covers every way a branch can come back:
+#   contained     the tip is already reachable from the base (merge commit / ff)
+#   rebase-merged every commit has a patch-equivalent commit on the base
+#   squash-merged the branch's whole diff exists as one commit on the base
+#   merged PR     a merged pull request whose head contains the local tip
+#   empty         the branch holds no changes of its own against the base
+# The last four matter because a squash- or rebase-merged branch is never an
+# ancestor of the base, so `git branch --merged` calls it unmerged forever.
+#
+# A worktree with uncommitted changes, untracked files, or dirty submodules is
+# reported and left alone unless --force. The base-branch worktree and the
+# worktree you are standing in are never touched.
+#
+# Like git-worktree-add, this runs from inside the repo (any worktree or the
+# bare dir) or from the project directory that holds the worktrees.
+set -euo pipefail
+
+base_arg=""
+dry_run=0
+assume_yes=0
+force=0
+keep_branch=0
+do_fetch=1
+use_gh=1
+prune_branches=0
+selectors=()
+
+usage() {
+  cat <<'EOF'
+Usage: git-worktree-prune [selector...] [options]
+
+  selector          only consider worktrees whose path or branch matches this
+                    (substring match); default: every worktree
+
+  --base REF        base ref to judge merges against (default: remote default
+                    branch, else origin/main)
+  -n, --dry-run     report the plan and exit without removing anything
+  -y, --yes         remove without the confirmation prompt
+  --force           also remove worktrees with local modifications
+  --keep-branch     remove the worktree but keep its local branch
+  --no-fetch        skip the fetch (judge against the refs already on disk)
+  --no-gh           do not consult GitHub pull request state
+  --prune-branches  also delete merged local branches that have no worktree
+  -h, --help        show this help
+
+With no --yes and no tty, the plan is printed and nothing is removed.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base) base_arg="${2:?--base needs a ref}"; shift 2 ;;
+    -n|--dry-run) dry_run=1; shift ;;
+    -y|--yes) assume_yes=1; shift ;;
+    --force) force=1; shift ;;
+    --keep-branch) keep_branch=1; shift ;;
+    --no-fetch) do_fetch=0; shift ;;
+    --no-gh) use_gh=0; shift ;;
+    --prune-branches) prune_branches=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "git-worktree-prune: unknown option '$1'" >&2; usage >&2; exit 1 ;;
+    *) selectors+=("$1"); shift ;;
+  esac
+done
+
+# Resolve a git context. If cwd isn't inside a repo, try the project-directory
+# layout: a sibling bare dir named "<cwd>.git", or the first immediate
+# subdirectory that is a worktree/repo.
+git_cmd=(git)
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  candidate=""
+  if [[ -d "${PWD}.git" ]] && git -C "${PWD}.git" rev-parse --is-bare-repository >/dev/null 2>&1; then
+    candidate="${PWD}.git"
+  else
+    for d in */; do
+      [[ -d "$d" ]] || continue
+      if git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then candidate="$d"; break; fi
+    done
+  fi
+  if [[ -z "$candidate" ]]; then
+    echo "git-worktree-prune: not inside a git repository and none found under $PWD" >&2
+    exit 1
+  fi
+  git_cmd=(git -C "$candidate")
+fi
+
+git_q() { "${git_cmd[@]}" "$@" 2>/dev/null; }
+
+# Drop admin entries for worktrees whose directory is already gone, so the
+# analysis below only sees real ones.
+prune_flags=(-v)
+(( dry_run )) && prune_flags+=(-n)
+pruned=$("${git_cmd[@]}" worktree prune "${prune_flags[@]}" 2>&1 || true)
+if [[ -n "$pruned" ]]; then
+  echo "git-worktree-prune: stale worktree entries:"
+  echo "$pruned"
+fi
+
+if [[ "$do_fetch" -eq 1 ]]; then
+  # Bare-repo gotcha: without the standard refspec, fetch never populates
+  # refs/remotes/origin/* and there is nothing to judge merges against.
+  if ! "${git_cmd[@]}" config --get-all remote.origin.fetch | grep -q 'refs/remotes/origin/'; then
+    "${git_cmd[@]}" config --add remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+    echo "git-worktree-prune: added origin fetch refspec"
+  fi
+  "${git_cmd[@]}" fetch --prune origin
+fi
+
+base="$base_arg"
+if [[ -z "$base" ]]; then
+  if def=$(git_q symbolic-ref --quiet refs/remotes/origin/HEAD); then
+    base="${def#refs/remotes/}"
+  else
+    base="origin/main"
+  fi
+fi
+if ! git_q rev-parse --verify --quiet "$base" >/dev/null; then
+  echo "git-worktree-prune: base ref '$base' not found" >&2
+  exit 1
+fi
+# The local branch name behind the base ref, so the worktree checked out on the
+# base is recognized whichever remote it came from.
+base_short="${base#refs/remotes/}"
+base_remote="${base_short%%/*}"
+if git_q config --get "remote.$base_remote.url" >/dev/null; then
+  base_short="${base_short#*/}"
+fi
+
+# owner/repo for the GitHub API, when origin is a GitHub remote.
+gh_slug=""
+if [[ "$use_gh" -eq 1 ]] && command -v gh >/dev/null 2>&1; then
+  origin_url=$(git_q remote get-url origin || true)
+  if [[ "$origin_url" == *github.com* ]]; then
+    gh_slug="${origin_url#*github.com}"
+    gh_slug="${gh_slug#:}"
+    gh_slug="${gh_slug#/}"
+    gh_slug="${gh_slug%.git}"
+  fi
+fi
+
+# Why the local tip needs no further review, or nothing if it still holds work
+# that isn't on the base. Prints the reason and returns 0 when landed.
+merge_reason() {
+  local tip="$1"
+
+  if git_q merge-base --is-ancestor "$tip" "$base"; then
+    echo "contained in $base_short"; return 0
+  fi
+
+  local mb
+  mb=$(git_q merge-base "$base" "$tip") || return 1
+
+  if git_q diff --quiet "$mb" "$tip"; then
+    echo "no changes vs $base_short"; return 0
+  fi
+
+  # git cherry marks a commit '-' when the base already has an equivalent patch
+  # and '+' when it does not, so an all-'-' listing means every commit landed
+  # individually — what a rebase merge leaves behind.
+  local cherry
+  cherry=$(git_q cherry "$base" "$tip" || true)
+  if [[ -n "$cherry" ]] && ! grep -q '^+' <<<"$cherry"; then
+    echo "every commit already on $base_short"; return 0
+  fi
+
+  # A squash merge collapses the branch into one commit, so compare like with
+  # like: build a throwaway commit holding the branch's whole diff over the
+  # merge base and ask whether the base has that same patch. The object is
+  # unreferenced and gets collected by the next gc.
+  local tree probe
+  if tree=$(git_q rev-parse "$tip^{tree}") &&
+     probe=$(git_q commit-tree "$tree" -p "$mb" -m squash-probe) &&
+     [[ $(git_q cherry "$base" "$probe" || true) == -* ]]; then
+    echo "squash-merged into $base_short"; return 0
+  fi
+
+  return 1
+}
+
+# A merged pull request whose head commit contains the local tip. This catches
+# branches whose landed diff no longer matches (the base moved under them), and
+# the head-sha check is what keeps local commits made after the merge from
+# being thrown away.
+pr_reason() {
+  local branch="$1" tip="$2"
+  [[ -n "$gh_slug" ]] || return 1
+
+  local pr
+  pr=$(gh pr list -R "$gh_slug" --head "$branch" --state merged --limit 1 \
+        --json number,headRefOid --jq '.[0] | "\(.number) \(.headRefOid)"' 2>/dev/null) || return 1
+  [[ -n "$pr" && "$pr" != "null"* ]] || return 1
+
+  local number="${pr%% *}" head="${pr##* }"
+  if [[ "$head" == "$tip" ]] || git_q merge-base --is-ancestor "$tip" "$head"; then
+    echo "PR #$number merged"; return 0
+  fi
+  # HOLD: marks a reason worth showing the user that is still not a go-ahead.
+  echo "HOLD:PR #$number merged, but the local tip holds commits it never saw"
+  return 1
+}
+
+selected() {
+  local path="$1" branch="$2" s
+  (( ${#selectors[@]} == 0 )) && return 0
+  for s in "${selectors[@]}"; do
+    [[ "$path" == *"$s"* || "$branch" == *"$s"* ]] && return 0
+  done
+  return 1
+}
+
+cwd_wt=""
+if top=$(git rev-parse --show-toplevel 2>/dev/null); then
+  cwd_wt=$(cd "$top" && pwd -P)
+fi
+
+# Parallel arrays of the plan, split by what we'll do with each entry.
+prune_paths=(); prune_branches_list=(); prune_reasons=(); prune_dirty=()
+hold_names=(); hold_reasons=()
+
+# Sort one worktree into the prune or keep list.
+classify() {
+  local path="$1" head="$2" ref="$3" is_bare="$4"
+  (( is_bare )) && return 0
+  [[ -n "$path" ]] || return 0
+
+  local name branch
+  name=$(basename "$path")
+  branch="${ref#refs/heads/}"
+
+  selected "$path" "$branch" || return 0
+
+  # Only reachable under --dry-run; otherwise the prune above already cleared it.
+  if [[ ! -d "$path" ]]; then
+    hold_names+=("$name [${branch:-detached}]"); hold_reasons+=("directory gone — the entry alone gets cleared")
+    return 0
+  fi
+  if [[ -z "$ref" ]]; then
+    hold_names+=("$name (detached)"); hold_reasons+=("detached HEAD — no branch to judge")
+    return 0
+  fi
+  if [[ "$branch" == "$base_short" ]]; then
+    hold_names+=("$name [$branch]"); hold_reasons+=("base branch")
+    return 0
+  fi
+  if [[ "$(cd "$path" && pwd -P)" == "$cwd_wt" ]]; then
+    hold_names+=("$name [$branch]"); hold_reasons+=("you are standing in it — cd out and re-run")
+    return 0
+  fi
+
+  local reason
+  reason=$(merge_reason "$head" || true)
+  if [[ -z "$reason" ]]; then
+    reason=$(pr_reason "$branch" "$head" || true)
+    # pr_reason names the PR even when it declines to act on it.
+    if [[ "$reason" == HOLD:* ]]; then
+      hold_names+=("$name [$branch]"); hold_reasons+=("${reason#HOLD:}")
+      return 0
+    fi
+  fi
+  if [[ -z "$reason" ]]; then
+    local ahead
+    ahead=$(git_q rev-list --count "$base..$head" || echo "?")
+    hold_names+=("$name [$branch]"); hold_reasons+=("$ahead commit(s) not on $base_short")
+    return 0
+  fi
+
+  local dirt lines
+  dirt=$(git -C "$path" status --porcelain)
+  if [[ -n "$dirt" ]] && (( ! force )); then
+    lines=$(grep -c '' <<<"$dirt")
+    hold_names+=("$name [$branch]"); hold_reasons+=("$reason, but $lines uncommitted change(s) — use --force")
+    return 0
+  fi
+
+  prune_paths+=("$path"); prune_branches_list+=("$branch"); prune_reasons+=("$reason")
+  prune_dirty+=("$([[ -n "$dirt" ]] && echo 1 || echo 0)")
+}
+
+# --porcelain emits one blank-line-separated stanza per worktree.
+wt_path=""; wt_head=""; wt_ref=""; wt_bare=0
+while IFS= read -r line; do
+  case "$line" in
+    "") classify "$wt_path" "$wt_head" "$wt_ref" "$wt_bare"
+        wt_path=""; wt_head=""; wt_ref=""; wt_bare=0 ;;
+    "worktree "*) wt_path="${line#worktree }" ;;
+    "HEAD "*) wt_head="${line#HEAD }" ;;
+    "branch "*) wt_ref="${line#branch }" ;;
+    bare) wt_bare=1 ;;
+  esac
+done < <("${git_cmd[@]}" worktree list --porcelain)
+classify "$wt_path" "$wt_head" "$wt_ref" "$wt_bare"
+
+# Merged local branches with no worktree of their own — the residue left when a
+# worktree was removed by hand.
+stale_branches=()
+stale_reasons=()
+if (( prune_branches )); then
+  while IFS=$'\t' read -r branch tip wt; do
+    [[ -n "$branch" ]] || continue
+    [[ "$branch" == "$base_short" ]] && continue
+    [[ -n "$wt" ]] && continue
+    selected "" "$branch" || continue
+    reason=$(merge_reason "$tip" || true)
+    [[ -z "$reason" ]] && reason=$(pr_reason "$branch" "$tip" || true)
+    if [[ -n "$reason" && "$reason" != HOLD:* ]]; then
+      stale_branches+=("$branch"); stale_reasons+=("$reason")
+    fi
+  done < <("${git_cmd[@]}" for-each-ref --format='%(refname:short)%09%(objectname)%09%(worktreepath)' refs/heads)
+fi
+
+total=$(( ${#prune_paths[@]} + ${#stale_branches[@]} ))
+
+if (( ${#prune_paths[@]} )); then
+  echo "prune (landed on $base_short):"
+  for i in "${!prune_paths[@]}"; do
+    printf '  %-40s %s%s\n' "$(basename "${prune_paths[$i]}") [${prune_branches_list[$i]}]" \
+      "${prune_reasons[$i]}" "$( (( prune_dirty[i] )) && echo ' — forced over local changes')"
+  done
+fi
+if (( ${#stale_branches[@]} )); then
+  echo "delete branches (no worktree):"
+  for i in "${!stale_branches[@]}"; do
+    printf '  %-40s %s\n' "${stale_branches[$i]}" "${stale_reasons[$i]}"
+  done
+fi
+if (( ${#hold_names[@]} )); then
+  echo "keep:"
+  for i in "${!hold_names[@]}"; do
+    printf '  %-40s %s\n' "${hold_names[$i]}" "${hold_reasons[$i]}"
+  done
+fi
+
+if (( total == 0 )); then
+  echo "git-worktree-prune: nothing to prune"
+  exit 0
+fi
+if (( dry_run )); then
+  exit 0
+fi
+if (( ! assume_yes )); then
+  if [[ -t 0 ]]; then
+    read -r -p "remove the above ($total)? [y/N] " answer
+    [[ "$answer" == [yY]* ]] || { echo "git-worktree-prune: aborted"; exit 1; }
+  else
+    echo "git-worktree-prune: re-run with --yes to remove the above"
+    exit 0
+  fi
+fi
+
+for (( i = 0; i < ${#prune_paths[@]}; i++ )); do
+  path="${prune_paths[$i]}"
+  branch="${prune_branches_list[$i]}"
+
+  # Populated submodules make plain `worktree remove` refuse outright, so fall
+  # back to --force once — cleanliness was already established above.
+  if ! "${git_cmd[@]}" worktree remove "$path" 2>/dev/null; then
+    "${git_cmd[@]}" worktree remove --force "$path"
+  fi
+  echo "git-worktree-prune: removed worktree $path"
+
+  if (( ! keep_branch )); then
+    # -D, not -d: a squash- or rebase-merged branch is not an ancestor of the
+    # base, so -d would refuse to delete it.
+    "${git_cmd[@]}" branch -D "$branch" >/dev/null
+    echo "git-worktree-prune: deleted branch $branch"
+    if git_q show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+      echo "git-worktree-prune: origin/$branch still exists; delete it with 'git push origin --delete $branch'"
+    fi
+  fi
+done
+
+for (( i = 0; i < ${#stale_branches[@]}; i++ )); do
+  branch="${stale_branches[$i]}"
+  "${git_cmd[@]}" branch -D "$branch" >/dev/null
+  echo "git-worktree-prune: deleted branch $branch"
+done
+
+"${git_cmd[@]}" worktree prune

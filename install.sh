@@ -31,6 +31,14 @@ link "$DOTFILES/tmux/.tmux.conf" "$HOME/.tmux.conf"
 echo "Claude"
 mkdir -p "$HOME/.claude"
 link "$DOTFILES/claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
+link "$DOTFILES/claude/agents" "$HOME/.claude/agents"
+link "$DOTFILES/claude/statusline-command.sh" "$HOME/.claude/statusline-command.sh"
+link "$DOTFILES/claude/bin/claude-spend" "$HOME/.local/bin/claude-spend"
+
+echo "bin"
+for script in "$DOTFILES"/bin/*; do
+    link "$script" "$HOME/.local/bin/$(basename "$script")"
+done
 
 echo ""
 echo "Done. Manual steps remaining:"

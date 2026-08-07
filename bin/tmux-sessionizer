@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# tmux-sessionizer — fuzzy-pick a project directory and jump to a tmux session
+# for it, creating the session if it doesn't exist yet.
+#
+# Search roots default to ~/work, ~/personal, and their bare-repo "project
+# directory" worktrees (see git-worktree-add): each root is searched two
+# levels deep for git worktrees (dirs containing .git) plus the roots
+# themselves. Override the roots with TMUX_SESSIONIZER_ROOTS (colon-separated).
+#
+# Session names are derived from the directory name, with dots replaced by
+# underscores since tmux treats '.' as a session:window separator.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: tmux-sessionizer [path]
+
+  path    jump directly to this directory instead of fuzzy-picking one
+
+Set TMUX_SESSIONIZER_ROOTS (colon-separated dirs) to override the default
+search roots of ~/work and ~/personal.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+roots=()
+IFS=':' read -ra roots <<<"${TMUX_SESSIONIZER_ROOTS:-$HOME/work:$HOME/personal}"
+
+if [[ -n "${1:-}" ]]; then
+  selected="$1"
+else
+  selected=$(
+    {
+      for root in "${roots[@]}"; do
+        [[ -d "$root" ]] || continue
+        printf '%s\n' "$root"
+        find "$root" -mindepth 1 -maxdepth 2 -name '.git' -exec dirname {} \; 2>/dev/null
+      done
+    } | sort -u | fzf
+  )
+fi
+
+[[ -z "${selected:-}" ]] && exit 0
+[[ -d "$selected" ]] || { echo "tmux-sessionizer: no such directory: $selected" >&2; exit 1; }
+
+session_name=$(basename "$selected" | tr '.' '_')
+
+if ! tmux has-session -t "$session_name" 2>/dev/null; then
+  tmux new-session -ds "$session_name" -c "$selected"
+fi
+
+if [[ -n "${TMUX:-}" ]]; then
+  tmux switch-client -t "$session_name"
+else
+  tmux attach-session -t "$session_name"
+fi

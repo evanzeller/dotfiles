@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# git-project-clone — clone a repo into the bare-backed "project directory"
+# layout that git-worktree-add expects.
+#
+# Produces:
+#   <project>.git/        bare clone (sibling of the project dir)
+#   <project>/            project dir holding worktrees
+#   <project>/.git        pointer file: "gitdir: ../<project>.git"
+#   <project>/<default>/  worktree for the remote default branch
+#
+# The .git pointer makes git operate natively from <project> (worktree add,
+# fetch, branch), so no name-matching heuristic is needed to find the bare.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: git-project-clone <url> [project-dir]
+
+  url          repository URL to clone
+  project-dir  project directory to create (default: derived from url,
+               in the current directory)
+  -h, --help   show this help
+
+Creates <project-dir>.git (bare), a <project-dir>/.git pointer to it, and a
+worktree for the remote default branch under <project-dir>/.
+EOF
+}
+
+url=""
+project=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -*) echo "git-project-clone: unknown option '$1'" >&2; usage >&2; exit 1 ;;
+    *)
+      if [[ -z "$url" ]]; then url="$1"
+      elif [[ -z "$project" ]]; then project="$1"
+      else echo "git-project-clone: unexpected argument '$1'" >&2; exit 1; fi
+      shift ;;
+  esac
+done
+
+if [[ -z "$url" ]]; then
+  echo "git-project-clone: missing url" >&2
+  usage >&2
+  exit 1
+fi
+
+# Derive the project dir name from the url when not given (strip trailing .git).
+if [[ -z "$project" ]]; then
+  base="${url##*/}"
+  project="${base%.git}"
+fi
+
+# Normalize to an absolute path so the sibling bare and pointer are unambiguous.
+parent="$(cd "$(dirname "$project")" && pwd)"
+name="$(basename "$project")"
+project="$parent/$name"
+bare="$project.git"
+
+if [[ -e "$project" ]]; then
+  echo "git-project-clone: '$project' already exists" >&2
+  exit 1
+fi
+if [[ -e "$bare" ]]; then
+  echo "git-project-clone: '$bare' already exists" >&2
+  exit 1
+fi
+
+git clone --bare "$url" "$bare"
+
+# Bare clones omit the standard fetch refspec; add it so remote refs and
+# origin/HEAD populate on fetch.
+git -C "$bare" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+git -C "$bare" fetch origin
+git -C "$bare" remote set-head origin -a >/dev/null
+
+mkdir -p "$project"
+printf 'gitdir: ../%s.git\n' "$name" > "$project/.git"
+
+# Check out the default branch as the first worktree.
+default="$(git -C "$bare" symbolic-ref --short HEAD)"
+git -C "$bare" worktree add "$project/$default" "$default"
+
+echo "git-project-clone: created project '$project'"
+echo "  bare:     $bare"
+echo "  pointer:  $project/.git -> ../$name.git"
+echo "  worktree: $project/$default (branch '$default')"
